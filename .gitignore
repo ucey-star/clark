@@ -1,2 +1,5 @@
 backend/.env
 backend/credentials.json
+backend/token.json
+backend/client_secret.json
+.history/
