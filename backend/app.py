@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import openai
 import os
@@ -8,6 +8,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.cloud import texttospeech
+import uuid  # Add this to fix the NameError
+from datetime import datetime, timezone
+
 
 load_dotenv()
 # Load API Key from environment variable
@@ -29,6 +33,8 @@ SCOPES = [
 # # Initialize Gmail & Calendar API clients
 # gmail_service = build("gmail", "v1", credentials=credentials)
 # calendar_service = build("calendar", "v3", credentials=credentials)
+AUDIO_DIR = "audio_responses"
+os.makedirs(AUDIO_DIR, exist_ok=True)  # Ensure directory exists
 
 conversation_history = []
 
@@ -78,6 +84,35 @@ def get_credentials():
 
     return creds
 
+def speak_response_google(text):
+    client = texttospeech.TextToSpeechClient()
+    
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="en-US",
+        name="en-US-Wavenet-D",  # Male voice
+        ssml_gender=texttospeech.SsmlVoiceGender.MALE
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+
+    response = client.synthesize_speech(
+        input=synthesis_input, voice=voice, audio_config=audio_config
+    )
+
+    # Generate a unique filename
+    filename = f"{uuid.uuid4()}.mp3"
+    file_path = os.path.join(AUDIO_DIR, filename)
+
+    # Save the file
+    with open(file_path, "wb") as out:
+        out.write(response.audio_content)
+
+    print(f"✅ Audio file generated: {file_path}")  # Debugging
+
+    return filename  # Return the filename, NOT the full path
+
 
 # Function mapping for Clark
 # def handle_email_action(action, email_subject=None, email_body=None):
@@ -95,17 +130,16 @@ def handle_email_action(action, email_subject=None, email_body=None):
     """
     Perform email-related actions such as reading recent emails or sending emails.
     """
-    creds = get_credentials()  # Use the function that reuses or refreshes the token
+    creds = get_credentials()
     service = build("gmail", "v1", credentials=creds)
 
     if action == "read_emails":
         try:
-            # Fetch up to 5 recent messages
             results = service.users().messages().list(userId="me", maxResults=5).execute()
             messages = results.get("messages", [])
 
             if not messages:
-                return "You have no unread emails."
+                return "You have no new emails."
 
             cleaned_emails = []
             for i, msg in enumerate(messages, start=1):
@@ -116,40 +150,19 @@ def handle_email_action(action, email_subject=None, email_body=None):
                     metadataHeaders=["Subject","From","Date"]
                 ).execute()
 
-                # Extract desired headers
                 headers = msg_data.get("payload", {}).get("headers", [])
                 
-                subject = next(
-                    (h["value"] for h in headers if h["name"] == "Subject"),
-                    "No Subject"
-                )
-                sender = next(
-                    (h["value"] for h in headers if h["name"] == "From"),
-                    "Unknown sender"
-                )
-                date_str = next(
-                    (h["value"] for h in headers if h["name"] == "Date"),
-                    "Unknown date"
-                )
-
-                # You can still get the snippet (short body preview)
+                subject = next((h["value"] for h in headers if h["name"] == "Subject"), "No Subject")
+                sender = next((h["value"] for h in headers if h["name"] == "From"), "Unknown sender")
+                date_str = next((h["value"] for h in headers if h["name"] == "Date"), "Unknown date")
                 snippet = msg_data.get("snippet", "")
-                # Optionally truncate the snippet to avoid large outputs
-                if len(snippet) > 120:
-                    snippet = snippet[:120] + "..."
+                snippet = snippet[:120] + "..." if len(snippet) > 120 else snippet
 
-                # Format a brief summary for each email
-                email_summary = (
-                    f"**Email {i}**\n"
-                    f"• **Subject:** {subject}\n"
-                    f"• **From:** {sender}\n"
-                    f"• **Date:** {date_str}\n"
-                    f"• **Snippet:** {snippet}\n"
-                )
+                email_summary = f"Email {i}: From {sender}, Subject: {subject}, Date: {date_str}. Summary: {snippet}"
                 cleaned_emails.append(email_summary)
 
-            # Join all summaries in a neat block
-            return "\n".join(cleaned_emails)
+            raw_response = "\n".join(cleaned_emails)
+            return format_with_gpt4(raw_response)  # ✅ Clean with GPT-4
 
         except Exception as e:
             return f"Error fetching emails: {e}"
@@ -160,43 +173,37 @@ def handle_email_action(action, email_subject=None, email_body=None):
     else:
         return "Unknown email action."
 
-    
-
-# def handle_calendar_action(action, event_details=None):
-#     """
-#     Function to handle calendar-related tasks.
-#     """
-#     if action == "check_schedule":
-#         return "You have a meeting tomorrow at 10 AM."
-#     elif action == "create_event":
-#         return f"Adding event: {event_details}"
-#     else:
-#         return "Unknown calendar action."
 
 def handle_calendar_action(action, event_details=None):
     """
     Perform calendar-related actions like checking upcoming events or scheduling new ones.
     """
-    creds = get_credentials()  # Use the function that reuses or refreshes the token
-    service = build("gmail", "v1", credentials=creds)
+    creds = get_credentials()
+    service = build("calendar", "v3", credentials=creds)
 
     if action == "check_schedule":
         try:
+            now = datetime.now(timezone.utc).isoformat()
             events_result = service.events().list(
                 calendarId="primary",
+                timeMin=now,  # ✅ Get only future events
                 maxResults=5,
                 singleEvents=True,
                 orderBy="startTime"
             ).execute()
             events = events_result.get("items", [])
 
+            if not events:
+                return "You have no upcoming events."
+
             event_list = []
             for event in events:
                 summary = event.get("summary", "No Title")
                 start = event["start"].get("dateTime", event["start"].get("date"))
-                event_list.append(f"📅 {summary} at {start}")
+                event_list.append(f"{summary} on {start}")
 
-            return "\n".join(event_list) if event_list else "You have no upcoming events."
+            raw_response = "\n".join(event_list)
+            return format_with_gpt4(raw_response)  # ✅ Clean with GPT-4
 
         except Exception as e:
             return f"Error fetching calendar events: {e}"
@@ -207,6 +214,26 @@ def handle_calendar_action(action, event_details=None):
     else:
         return "Unknown calendar action."
 
+
+
+def format_with_gpt4(raw_text):
+    """
+    Uses OpenAI's GPT-4 to clean up the response and make it more readable for voice output.
+    """
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Format this response for a voice assistant. Make it clear, short, and natural to read aloud."},
+                {"role": "user", "content": raw_text}
+            ],
+            max_tokens=300
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print(f"Error formatting with GPT-4: {e}")
+        return raw_text  # Return raw text if formatting fails
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -267,19 +294,27 @@ def chat():
 
             if function_name == "handle_email_action":
                 ai_response = handle_email_action(**arguments)
+                audio_file = speak_response_google(ai_response)
             elif function_name == "handle_calendar_action":
                 ai_response = handle_calendar_action(**arguments)
+                audio_file = speak_response_google(ai_response)
             else:
                 ai_response = "Unknown function request."
+                audio_file = speak_response_google(ai_response)
         else:
             ai_response = response.choices[0].message.content
+            audio_file = speak_response_google(ai_response)
 
         conversation_history.append({"role": "assistant", "content": ai_response})
-        return jsonify({"response": ai_response})
+        return jsonify({"response": ai_response, "audio": audio_file})
 
     except Exception as e:
         print("error", e)
         return jsonify({"error": str(e)}), 500
+
+@app.route("/audio/<filename>")
+def get_audio(filename):
+    return send_from_directory(AUDIO_DIR, filename)  # Ensure the correct directory is used
 
 if __name__ == "__main__":
     app.run(debug=True, port=5001)

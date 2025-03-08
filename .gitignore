@@ -3,3 +3,4 @@ backend/credentials.json
 backend/token.json
 backend/client_secret.json
 .history/
+backend/audio_responses/
